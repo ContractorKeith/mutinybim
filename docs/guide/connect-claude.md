@@ -115,13 +115,7 @@ a 9 ft ceiling in each room, and a plan of each floor on its own sheet.
 2. In your connected assistant, ask:
 
    > In my MutinyBIM model "Small office", run the small-office example
-   > script. The model already has Level 1: use it rather than making a
-   > new one.
-
-   A blank model starts with a level named Level 1, and the example makes
-   its own. Run as written, it stops with "There is already a level named
-   Level 1". The example's own notes say how to use a level the model
-   already has, and the assistant can follow them.
+   > script.
 
 3. The assistant fetches the example, checks it and runs a preview. Nothing
    changes yet.
