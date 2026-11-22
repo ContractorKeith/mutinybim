@@ -41,7 +41,8 @@ function sitePaths(generated: ReadonlyMap<string, string>): Map<string, string> 
   const map = new Map<string, string>(Object.entries(ROOT_PAGES));
   const handWritten = walk(join(REPO_ROOT, "docs")).map((f) => relative(REPO_ROOT, f).split("\\").join("/"));
   for (const path of [...handWritten, ...generated.keys()]) {
-    if (path.startsWith("docs/") && path.endsWith(".md")) map.set(path, path.slice("docs/".length));
+    // A folder's README.md is its index page (/guide/ serves guide/index.md).
+    if (path.startsWith("docs/") && path.endsWith(".md")) map.set(path, path.slice("docs/".length).replace(/(^|\/)README\.md$/, "$1index.md"));
   }
   return map;
 }
@@ -92,9 +93,9 @@ function sidebar(pages: ReadonlyMap<string, string>, titles: ReadonlyMap<string,
       })
       .map((p) => ({ text: titles.get(p) ?? p, link: link(p) }));
   return [
-    { text: "Guide", items: items((p) => p.startsWith("guide/"), ["guide/README.md", "guide/getting-started.md", "guide/editor-tour.md", "guide/connect-claude.md"]) },
+    { text: "Guide", items: items((p) => p.startsWith("guide/"), ["guide/index.md", "guide/getting-started.md", "guide/editor-tour.md", "guide/connect-claude.md"]) },
     { text: "Building on MutinyBIM", items: items((p) => !p.includes("/") && p !== "index.md", ["ARCHITECTURE.md", "SCRIPTING.md", "CONNECT-AN-AGENT.md", "ADD-ON-CONTRACT.md", "YOUR-FIRST-ADD-ON.md"]) },
-    { text: "Reference", items: items((p) => p.startsWith("reference/") && !p.startsWith("reference/script-kit/"), ["reference/README.md", "reference/examples.md", "reference/recipes.md"]) },
+    { text: "Reference", items: items((p) => p.startsWith("reference/") && !p.startsWith("reference/script-kit/"), ["reference/index.md", "reference/examples.md", "reference/recipes.md"]) },
     { text: "Script kit", collapsed: false, items: items((p) => p.startsWith("reference/script-kit/"), ["reference/script-kit/ctx.md", "reference/script-kit/define-script.md", "reference/script-kit/units.md", "reference/script-kit/building.md", "reference/script-kit/routes.md", "reference/script-kit/equipment.md", "reference/script-kit/parts.md", "reference/script-kit/part-builder.md", "reference/script-kit/documents.md", "reference/script-kit/checks.md"]) },
     { text: "Project", collapsed: true, items: items((p) => p.startsWith("project/")) },
   ];
