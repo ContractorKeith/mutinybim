@@ -10,17 +10,32 @@ import { FragmentsModels, type FragmentsModel } from "@thatopen/fragments";
 import { asElementId, elementEntries, type Aabb3, type CropBox3d, type CropFace, type DisplayContext, type ElementId, type ModelState, type RouteJoin, type View3dCamera, findLevelByName, normalizeLevelName } from "@permitzip/bim-kernel";
 import { liveDisplayOf, liveViewRangeExcludes, type CategoryView } from "./live-display";
 import { livePlanSymbols, symbolPositions, type LivePlanText } from "./live-plan-graphics";
+import { buildScalarHeatmapGroup, type ScalarHeatmapOverlay } from "./scalar-heatmap";
+import { SceneLightingController, type SceneLightEmitter, type SceneLightingPreset } from "./scene-lighting";
 import { PlanFootprintGrid } from "./plan-near-miss";
 import { ifcPlacementToScene, kernelToScene, MM, sceneToKernel, toColumnMajor, type Mat4Rows, type Vec3Tuple } from "./coords";
 import { robustCore } from "./framing";
 import { DEFAULT_ELEVATIONS, modelSolids, routeJoinSolids, type ElevationRules, type RenderGroup, type Solid } from "./native-geometry";
 import { batchMeshSolids, batchOwnerAt, type MeshBatch } from "./mesh-batches";
-import { buildStudioEnvironment, cleanEdgesGeometry, ensureBoxUVs, inflateAlongNormals, proceduralMaterialMaps } from "./procedural-textures";
+import { applyCeilingGridUVs, buildStudioEnvironment, cleanEdgesGeometry, ensureBoxUVs, inflateAlongNormals, proceduralMaterialMaps } from "./procedural-textures";
 import { materialOf, parseHexColor, type MaterialPattern } from "@permitzip/bim-kernel";
 import { readReferenceItem, type ReferenceItemProperties } from "./item-properties";
 import { nearestTurn, type Orientation, type PlanRectMm } from "./orientation";
 import { screenBoxes, type ScreenRect } from "./box-select";
-import { ARROW_PX, buildArrows, chooseOrbitPivot, gizmoHandleAt, gizmoScreen, metresPerPixel, planUpVector, pointOnScreen, type GizmoHandle, type GizmoScreen } from "./origin-gizmo";
+import {
+  ARROW_PX,
+  buildArrows,
+  buildDepthAwareAxisLines,
+  chooseOrbitPivot,
+  gizmoHandleAt,
+  gizmoScreen,
+  metresPerPixel,
+  planUpVector,
+  pointOnScreen,
+  updateDepthAwareAxisLines,
+  type GizmoHandle,
+  type GizmoScreen,
+} from "./origin-gizmo";
 import { ViewerPalette, type ViewerColors } from "./viewer-colors";
 import { matchCamera, orthoZoomFor, type Projection, type ViewCamera } from "./projection";
 import { makeCameraControls, pinOrbitPoint, zoomFloorFor, type PointZoomControls, type ZoomAnchorQuery } from "./navigation";
@@ -102,7 +117,7 @@ const GROUP_STYLE: Record<RenderGroup, { color: number; roughness: number; metal
   duct: { color: 0x2f7fd8, roughness: 0.45, metalness: 0.35 },
   duct_fitting: { color: 0x2569b8, roughness: 0.45, metalness: 0.35 },
   terminal: { color: 0xe9eef5, roughness: 0.6, metalness: 0.1 },
-  equipment: { color: 0x5b6b7a, roughness: 0.55, metalness: 0.4 },
+  equipment: { color: 0xb8c2cc, roughness: 0.24, metalness: 0.82 },
   pipe: { color: 0x2ea86b, roughness: 0.4, metalness: 0.3 },
   electrical: { color: 0xd9a21b, roughness: 0.5, metalness: 0.2 },
   sprinkler: { color: 0xd8463b, roughness: 0.45, metalness: 0.3 },
@@ -228,6 +243,22 @@ export function choosePickHits<P>(hits: readonly { readonly pick: P; readonly se
   return { solid: hits.find((h) => !h.seeThrough)?.pick ?? null, seeThrough: hits.find((h) => h.seeThrough)?.pick ?? null };
 }
 
+/**
+ * Detect CPU software WebGL renderers (SwiftShader, llvmpipe, Windows Basic Render Driver)
+ * where per-fragment 9-tap PCF shadows and PMREM IBL cut frame rate in half and starve UI input.
+ */
+function isSoftwareWebGL(renderer: THREE.WebGLRenderer): boolean {
+  try {
+    const gl = renderer.getContext();
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    const unmasked = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) ?? "") : "";
+    const basic = String(gl.getParameter(gl.RENDERER) ?? "");
+    return /swiftshader|llvmpipe|software|basic render driver|mesa offscreen/i.test(`${unmasked} ${basic}`);
+  } catch {
+    return false;
+  }
+}
+
 export class ModelViewer3D {
   readonly scene = new THREE.Scene();
   readonly renderer: THREE.WebGLRenderer;
@@ -236,8 +267,12 @@ export class ModelViewer3D {
   /** The 3D view's parallel camera (plan keeps its own straight-down one). */
   private readonly orthoView: THREE.OrthographicCamera;
   private sunLight: THREE.DirectionalLight | null = null;
+  private lightingController: SceneLightingController | null = null;
+  private readonly lightEmitterRoot = new THREE.Group();
+  private readonly lightFocusScratch = new THREE.Vector3();
   private shadowsEnabled = true;
   private renderQuality: "draft" | "standard" | "high" = "standard";
+  private studioEnv: THREE.Texture | null = null;
   private projection: Projection = "perspective";
   /** Where the 3D view was looking when plan took over (a projection switch in plan frames about it). */
   private readonly last3dTarget = new THREE.Vector3();
@@ -275,6 +310,8 @@ export class ModelViewer3D {
   private selectedOverlayShown = false;
   /** Plan only: the plan symbols the printed drawing draws (a door's swing, a window's lines), over the cut; never picked. */
   private readonly planSymbolRoot = new THREE.Group();
+  /** Trade-agnostic 3D false-color scalar heatmap overlay (e.g. illuminance, coverage); never picked. */
+  private readonly scalarHeatmapRoot = new THREE.Group();
   private planSymbolMaterial: THREE.LineBasicMaterial | null = null;
   /** Plan text textures by colour and text, kept across redraws; freed on dispose. */
   private readonly planTextTextures = new Map<string, { texture: THREE.CanvasTexture; aspect: number }>();
@@ -289,8 +326,10 @@ export class ModelViewer3D {
   private readonly referenceRoot = new THREE.Group();
   private readonly markerRoot = new THREE.Group();
   private readonly palette: ViewerPalette;
-  /** The origin marker's arrows, in the theme's axis colors (the axis lines and label are drawn over the canvas from `originGizmoScreen`). */
+  /** The origin marker's arrows, in the theme's axis colors. */
   private readonly origin: THREE.Group;
+  /** Depth-aware 3D dashed axis lines (crisp in front of the building, softly dimmed behind it). */
+  private readonly originAxes: THREE.Group;
   /** The project origin (base point), scene metres: the orbit point when none is chosen and nothing is loaded or drawn. */
   private readonly projectOrigin = new THREE.Vector3();
   private referencesBoxCache: Promise<THREE.Box3> | null = null;
@@ -326,6 +365,7 @@ export class ModelViewer3D {
   private readonly cropOutline: CropBoxOutline;
   private readonly cameraListeners = new Set<() => void>();
   private readonly cameraSettledListeners = new Set<() => void>();
+  private fovDirty = false;
   private readonly pointerClaims = new Set<symbol>();
   private selected: Pick | null = null;
   private frameCount = 0;
@@ -344,16 +384,25 @@ export class ModelViewer3D {
     this.elevations = options.elevations ?? DEFAULT_ELEVATIONS;
     this.palette = new ViewerPalette(options.colors);
     this.origin = buildArrows(this.palette.axes);
+    this.originAxes = buildDepthAwareAxisLines(this.palette.axes);
+    this.originAxes.visible = false;
     this.cropOutline = new CropBoxOutline(this.palette.css("selectionOutline"));
     this.overlayScene.add(this.cropOutline.object);
     // Standard hardware 24-bit depth buffer (logarithmicDepthBuffer writes gl_FragDepth, which disables hardware gl.polygonOffset and early-Z culling).
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const softwareGpu = isSoftwareWebGL(this.renderer);
+    if (softwareGpu) {
+      this.renderQuality = "draft";
+    }
+    this.renderer.setPixelRatio(softwareGpu ? 1 : Math.min(window.devicePixelRatio || 1, 1.5));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
-    this.renderer.shadowMap.enabled = true;
+    this.renderer.toneMappingExposure = softwareGpu ? 1.0 : 1.05;
+    this.renderer.shadowMap.enabled = !softwareGpu;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // Shadows only change when geometry, visibility, clipping, sun, or quality change — never on mouse hover/orbit.
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = !softwareGpu;
     this.renderer.localClippingEnabled = false;
     // Counted per frame, across the model pass and the crop box outline pass.
     this.renderer.info.autoReset = false;
@@ -362,16 +411,20 @@ export class ModelViewer3D {
     container.appendChild(this.renderer.domElement);
 
     this.scene.background = this.palette.background;
-    const env = buildStudioEnvironment(this.renderer);
-    if (env) {
-      this.scene.environment = env;
-      this.scene.environmentIntensity = 0.65;
+    if (!softwareGpu) {
+      const env = buildStudioEnvironment(this.renderer);
+      if (env) {
+        this.studioEnv = env;
+        this.scene.environment = env;
+        this.scene.environmentIntensity = 0.65;
+      }
     }
     // Low ambient + a strong key light with soft shadows so walls, openings and floors read with real depth.
-    this.scene.add(new THREE.HemisphereLight(0xf6f8fc, 0x7d8794, 0.85));
-    const sun = new THREE.DirectionalLight(0xfff6ea, 2.2);
+    const hemi = new THREE.HemisphereLight(0xf6f8fc, 0x7d8794, softwareGpu ? 0.95 : 0.85);
+    this.scene.add(hemi);
+    const sun = new THREE.DirectionalLight(0xfff6ea, softwareGpu ? 2.3 : 2.2);
     sun.position.set(60, 100, 35);
-    sun.castShadow = true;
+    sun.castShadow = !softwareGpu;
     sun.shadow.mapSize.set(2048, 2048);
     sun.shadow.camera.near = 1;
     sun.shadow.camera.far = 300;
@@ -387,6 +440,17 @@ export class ModelViewer3D {
     const fill = new THREE.DirectionalLight(0xdfe8ff, 0.5);
     fill.position.set(-50, 30, -40);
     this.scene.add(fill);
+    this.lightEmitterRoot.name = "light-emitter-root";
+    this.lightingController = new SceneLightingController(
+      this.renderer,
+      this.scene,
+      hemi,
+      sun,
+      fill,
+      this.lightEmitterRoot,
+      this.studioEnv,
+      this.palette.background,
+    );
     // Subtle matte architectural ground shadow catcher positioned below the lowest slab (FrontSide only, never visible from underneath).
     const groundShadow = new THREE.Mesh(
       new THREE.PlaneGeometry(400, 400),
@@ -395,10 +459,11 @@ export class ModelViewer3D {
     groundShadow.rotation.x = -Math.PI / 2;
     groundShadow.position.y = -0.3;
     groundShadow.receiveShadow = true;
+    groundShadow.visible = !softwareGpu;
     groundShadow.name = "architectural-ground-shadow";
     this.groundShadowPlane = groundShadow;
     this.scene.add(groundShadow);
-    this.scene.add(this.referenceRoot, this.nativeRoot, this.markerRoot, this.ghostRoot, this.groupRoot, this.highlightRoot, this.joinRoot, this.planSymbolRoot, this.selectedRoot, this.origin);
+    this.scene.add(this.referenceRoot, this.nativeRoot, this.markerRoot, this.ghostRoot, this.groupRoot, this.highlightRoot, this.joinRoot, this.planSymbolRoot, this.scalarHeatmapRoot, this.lightEmitterRoot, this.selectedRoot, this.originAxes, this.origin);
 
     const { width, height } = this.size();
     this.perspective = new THREE.PerspectiveCamera(45, width / height, 0.15, 3000);
@@ -489,7 +554,18 @@ export class ModelViewer3D {
     const delta = this.clock.getDelta();
     this.controls.update(delta);
     this.renderer.info.reset();
-    if (this.origin.visible) this.origin.scale.setScalar(ARROW_PX * metresPerPixel(this.camera(), this.origin.position, this.size().height));
+    const hPx = this.size().height;
+    if (this.origin.visible) this.origin.scale.setScalar(ARROW_PX * metresPerPixel(this.camera(), this.origin.position, hPx));
+    const show3dAxes = this.origin.visible && this.mode === "3d";
+    this.originAxes.visible = show3dAxes;
+    if (show3dAxes) {
+      this.originAxes.position.copy(this.origin.position);
+      updateDepthAwareAxisLines(this.originAxes, this.camera(), this.origin.position, hPx);
+    }
+    if (this.mode === "3d" && this.lightingController) {
+      this.controls.getTarget(this.lightFocusScratch);
+      this.lightingController.updateCameraFocus(this.camera(), this.lightFocusScratch);
+    }
     this.toneNewReferenceMaterials();
     this.renderer.render(this.scene, this.camera());
     if (this.cropOutline.object.visible) {
@@ -546,6 +622,7 @@ export class ModelViewer3D {
     this.referencesBoxCache = null;
     if (this.referenceTones.has(spec.id) || this.sessionHiddenReferences.has(spec.id)) await this.applyReferenceTone(spec.id, entry);
     void this.refreshOrbitFallback();
+    this.invalidateShadows();
     return info;
   }
 
@@ -559,6 +636,7 @@ export class ModelViewer3D {
     this.referencesBoxCache = null;
     await this.fragments.disposeModel(id);
     await this.fragments.update(true);
+    this.invalidateShadows();
     await this.refreshOrbitFallback();
   }
 
@@ -581,6 +659,7 @@ export class ModelViewer3D {
     const ref = this.references.get(id);
     if (ref && ref.model.object.visible !== visible) {
       ref.model.object.visible = visible;
+      this.invalidateShadows();
       this.referencesBoxCache = null;
       void this.refreshOrbitFallback();
     }
@@ -804,6 +883,7 @@ export class ModelViewer3D {
     }
     this.keepInPlanCut(this.authoredBox());
     this.drawPlanSymbols();
+    this.invalidateShadows();
     // Previews (a drag, a route being drawn) leave the orbit point alone; it follows the model once the edit lands.
     if (view === accepted) void this.refreshOrbitFallback();
   }
@@ -1042,11 +1122,12 @@ export class ModelViewer3D {
         group === "wall" ? "gypsum" : group === "slab" ? "concrete" : group === "filler" ? "wood" : undefined;
       const pattern = matDef?.pattern ?? defaultPattern;
       const colorHex = `#${color.toString(16).padStart(6, "0")}`;
-      const maps = pattern && opacity === undefined ? proceduralMaterialMaps(pattern, colorHex) : null;
+      const maps = pattern && opacity === undefined ? proceduralMaterialMaps(pattern, colorHex, materialId) : null;
       const mat = new THREE.MeshStandardMaterial({
         color: maps ? 0xffffff : color,
         roughness,
         metalness,
+        ...(group === "duct" || group === "duct_fitting" || group === "pipe" || group === "insulation" ? { side: THREE.DoubleSide } : {}),
         ...(maps ? { map: maps.map, bumpMap: maps.bumpMap, bumpScale: maps.bumpScale } : {}),
         // Push coplanar slab edges and roof/column faces subtly behind exterior wall cladding so flush wall-to-slab/parapet joints never z-fight.
         ...(group === "slab"
@@ -1080,6 +1161,11 @@ export class ModelViewer3D {
       if (child instanceof THREE.Mesh && child.material instanceof THREE.Material) child.material.dispose();
     }
     for (const child of [...buildArrows(this.palette.axes).children]) this.origin.add(child);
+    for (const child of [...this.originAxes.children]) {
+      this.originAxes.remove(child);
+      disposeObject(child);
+    }
+    for (const child of [...buildDepthAwareAxisLines(this.palette.axes).children]) this.originAxes.add(child);
     if (this.markerMaterials) {
       // Sprites keep their material; only the drawn symbol changes.
       const outline = this.palette.css("edges");
@@ -1127,7 +1213,19 @@ export class ModelViewer3D {
 
   private drawSolid(s: Solid, material: THREE.Material, outline: boolean, dashedEdges = false) {
     const geometry = solidGeometry(s);
-    ensureBoxUVs(geometry);
+    const modelEl = this.lastAuthored?.view.elements[s.elementId];
+    if (modelEl?.kind === "ceiling") {
+      const grid = modelEl.grid ?? { spacingXMm: 1219.2, spacingYMm: 609.6 };
+      // Mesh vertices are local to `s.center` (Three.js metres where kernelX = x*1000, kernelY = -z*1000);
+      // convert the kernel world grid origin into mesh-local mm so 3D tile joints match the RCP and snapped devices.
+      const localOrigin = {
+        x: (grid.origin?.x ?? 0) - s.center[0] * 1000,
+        y: (grid.origin?.y ?? 0) + s.center[2] * 1000,
+      };
+      applyCeilingGridUVs(geometry, { ...grid, origin: localOrigin });
+    } else {
+      ensureBoxUVs(geometry);
+    }
     const mesh = new THREE.Mesh(geometry, material);
     mesh.castShadow = s.group !== "glazing" && s.group !== "mounting_plane";
     mesh.receiveShadow = true;
@@ -1224,6 +1322,12 @@ export class ModelViewer3D {
       this.cutPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), cutM);
       if (this.sunLight) this.sunLight.castShadow = false;
       if (this.groundShadowPlane) this.groundShadowPlane.visible = false;
+      this.lightingController?.apply(this.lightingController.getPreset(), {
+        is3d: false,
+        shadowsEnabled: false,
+        renderQuality: this.renderQuality,
+        customBackground: true,
+      });
       this.scene.background = this.palette.planBackground;
       void this.setPlanCategoriesVisible(false);
       this.ortho.position.set(target.x, 200, target.z);
@@ -1239,9 +1343,17 @@ export class ModelViewer3D {
       this.carryControlState(enabled);
     } else {
       this.cutPlane = null;
-      if (this.sunLight) this.sunLight.castShadow = this.shadowsEnabled;
-      if (this.groundShadowPlane) this.groundShadowPlane.visible = this.shadowsEnabled;
+      const shadowsActive = this.shadowsEnabled && this.renderQuality !== "draft";
+      if (this.sunLight) this.sunLight.castShadow = shadowsActive;
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = shadowsActive;
       this.scene.background = this.palette.background;
+      if (this.lightingController) {
+        this.lightingController.apply(this.lightingController.getPreset(), {
+          is3d: true,
+          shadowsEnabled: this.shadowsEnabled,
+          renderQuality: this.renderQuality,
+        });
+      }
       void this.setPlanCategoriesVisible(true);
       const camera = this.camera3d();
       // An orbit point a click or a zoom chose survives a trip to plan: the 3D camera comes back as it was, orbiting that point.
@@ -1399,6 +1511,39 @@ export class ModelViewer3D {
     return this.projection;
   }
 
+  /**
+   * Lens angle of the perspective camera, degrees (clamped to 5..120, the range a
+   * saved 3D camera may store). Felt at once in perspective; an orthographic view
+   * keeps its framing, and the angle applies again on the switch back.
+   * Pass `{ settle: false }` while dragging a slider and `{ settle: true }` (default)
+   * when the gesture finishes so camera memory saves once without per-tick churn.
+   */
+  setFovDeg(fovDeg: number, options?: { readonly settle?: boolean }) {
+    const clamped = Math.min(120, Math.max(5, fovDeg));
+    const changed = Math.abs(this.perspective.fov - clamped) > 1e-6;
+    if (changed) {
+      this.perspective.fov = clamped;
+      this.perspective.updateProjectionMatrix();
+      this.fovDirty = true;
+      void this.fragments.update(true);
+      for (const listener of this.cameraListeners) listener();
+    }
+    if (options?.settle !== false && this.fovDirty) {
+      this.fovDirty = false;
+      for (const listener of this.cameraSettledListeners) listener();
+    }
+  }
+
+  /** The perspective camera's lens angle, degrees. */
+  getFovDeg(): number {
+    return this.perspective.fov;
+  }
+
+  /** Visible vertical span of the orthographic 3D camera, mm. */
+  getOrthoHeightMm(): number {
+    return (this.orthoView.top - this.orthoView.bottom) / Math.max(1e-6, this.orthoView.zoom) / MM;
+  }
+
   /** Look from `eye` at `target`; a parallel view zooms to frame what a perspective eye there would see. */
   private async lookFrom(eye: THREE.Vector3, target: THREE.Vector3, animate: boolean) {
     const camera = this.camera();
@@ -1419,6 +1564,11 @@ export class ModelViewer3D {
     this.setPlanCut((work.isEmpty() ? 1.5 : work.min.y + 1.5) / MM);
   }
 
+  /** Mark the cached directional shadow map dirty so the next frame refreshes it once. */
+  private invalidateShadows() {
+    if (this.renderer?.shadowMap) this.renderer.shadowMap.needsUpdate = true;
+  }
+
   /** Set the 3D directional sun angle in degrees (`azimuthDeg`: 0 = East, 90 = South, 180 = West; `elevationDeg`: 5..85). */
   setSun(azimuthDeg: number, elevationDeg: number) {
     if (!this.sunLight) return;
@@ -1427,46 +1577,96 @@ export class ModelViewer3D {
     const dist = 120;
     const horiz = Math.cos(el) * dist;
     this.sunLight.position.set(Math.cos(az) * horiz, Math.sin(el) * dist, Math.sin(az) * horiz);
+    this.invalidateShadows();
   }
 
-  /** Turn 3D sun shadows on or off (always off in 2D plan mode so floor plans stay crisp). */
+  /** Turn 3D sun shadows on or off (always off in 2D plan mode and Draft quality). */
   setShadows(enabled: boolean) {
     this.shadowsEnabled = enabled;
-    const active = this.mode === "3d" && enabled;
+    const active = this.mode === "3d" && enabled && this.renderQuality !== "draft";
     if (this.sunLight) this.sunLight.castShadow = active;
     if (this.groundShadowPlane) this.groundShadowPlane.visible = active;
+    this.invalidateShadows();
   }
 
   /** Switch 3D visual rendering quality (`draft` = fast matte, `standard` = balanced PBR + shadows, `high` = crisp 4K shadow map + rich studio exposure). */
   setRenderQuality(quality: "draft" | "standard" | "high") {
     this.renderQuality = quality;
+    const shadowsActive = this.mode === "3d" && this.shadowsEnabled && quality !== "draft";
     if (quality === "draft") {
       this.renderer.toneMappingExposure = 1.0;
       this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1));
+      this.renderer.shadowMap.enabled = false;
+      this.scene.environment = null;
       if (this.sunLight) this.sunLight.castShadow = false;
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = false;
     } else if (quality === "high") {
       this.renderer.toneMappingExposure = 1.12;
       this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      this.renderer.shadowMap.enabled = true;
+      if (!this.studioEnv) this.studioEnv = buildStudioEnvironment(this.renderer);
+      if (this.studioEnv) {
+        this.scene.environment = this.studioEnv;
+        this.scene.environmentIntensity = 0.65;
+      }
       if (this.sunLight) {
         this.sunLight.shadow.mapSize.set(4096, 4096);
         this.sunLight.shadow.map?.dispose();
         this.sunLight.shadow.map = null;
-        this.sunLight.castShadow = this.mode === "3d" && this.shadowsEnabled;
+        this.sunLight.castShadow = shadowsActive;
       }
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = shadowsActive;
     } else {
       this.renderer.toneMappingExposure = 1.05;
       this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+      this.renderer.shadowMap.enabled = true;
+      if (!this.studioEnv) this.studioEnv = buildStudioEnvironment(this.renderer);
+      if (this.studioEnv) {
+        this.scene.environment = this.studioEnv;
+        this.scene.environmentIntensity = 0.65;
+      }
       if (this.sunLight) {
         this.sunLight.shadow.mapSize.set(2048, 2048);
         this.sunLight.shadow.map?.dispose();
         this.sunLight.shadow.map = null;
-        this.sunLight.castShadow = this.mode === "3d" && this.shadowsEnabled;
+        this.sunLight.castShadow = shadowsActive;
       }
+      if (this.groundShadowPlane) this.groundShadowPlane.visible = shadowsActive;
     }
+    if (this.lightingController) {
+      this.lightingController.apply(this.lightingController.getPreset(), {
+        is3d: this.mode === "3d",
+        shadowsEnabled: this.shadowsEnabled,
+        renderQuality: quality,
+      });
+    }
+    this.invalidateShadows();
   }
 
   getRenderQuality(): "draft" | "standard" | "high" {
     return this.renderQuality;
+  }
+
+  /** Switch 3D time-of-day & atmosphere (`morning`, `noon`, `afternoon`, `evening`, `night`, `night_blackout`, `no_shadows`). */
+  setLightingPreset(preset: SceneLightingPreset) {
+    if (!this.lightingController) return;
+    const cfg = this.lightingController.apply(preset, {
+      is3d: this.mode === "3d",
+      shadowsEnabled: preset !== "no_shadows",
+      renderQuality: this.renderQuality,
+    });
+    this.shadowsEnabled = cfg.sunShadows;
+    if (this.groundShadowPlane) this.groundShadowPlane.visible = this.mode === "3d" && cfg.sunShadows;
+    this.invalidateShadows();
+  }
+
+  getLightingPreset(): SceneLightingPreset {
+    return this.lightingController?.getPreset() ?? "noon";
+  }
+
+  /** Set physical 3D light emitters rendered when the lighting preset illuminates active fixtures (evening/night/blackout). */
+  setLightEmitters(emitters: readonly SceneLightEmitter[]) {
+    this.lightingController?.setEmitters(emitters, this.mode === "3d", this.renderQuality);
   }
 
   setPlanCut(elevationMm: number) {
@@ -1594,6 +1794,7 @@ export class ModelViewer3D {
 
   private applyClipping() {
     this.renderer.clippingPlanes = [...(this.cutPlane ? [this.cutPlane] : []), ...this.sectionPlanes, ...this.cropBoxPlanes];
+    this.invalidateShadows();
     void this.fragments.update(true);
   }
 
@@ -1637,11 +1838,17 @@ export class ModelViewer3D {
   camera3dState(): View3dCamera | null {
     if (this.mode === "plan") return null;
     const camera = this.camera3d();
+    camera.updateMatrixWorld();
     const target = new THREE.Vector3();
     this.controls.getTarget(target);
+    // An off-centre orbit pin moves `controls.getTarget()` to the pivot while keeping the picture
+    // still via a focal offset. Project onto the camera's true viewing axis so saving and restoring
+    // (with the focal offset cleared) preserves the exact viewing direction on the first round trip.
+    const dist = Math.max(camera.position.distanceTo(target), 0.01);
+    const ahead = camera.position.clone().addScaledVector(camera.getWorldDirection(new THREE.Vector3()), dist);
     const k = (v: THREE.Vector3) => ({ x: v.x / MM, y: -v.z / MM, z: v.y / MM });
     const ortho = this.orthoView;
-    return { eye: k(camera.position), target: k(target), up: { x: 0, y: 0, z: 1 }, fovDeg: this.perspective.fov, orthoHeightMm: (ortho.top - ortho.bottom) / ortho.zoom / MM };
+    return { eye: k(camera.position), target: k(ahead), up: { x: 0, y: 0, z: 1 }, fovDeg: this.perspective.fov, orthoHeightMm: (ortho.top - ortho.bottom) / ortho.zoom / MM };
   }
 
   /** Where the plan camera looks and how far it is zoomed; null outside plan. `setPlanCamera` puts it back. */
@@ -1671,15 +1878,33 @@ export class ModelViewer3D {
     const s = (q: View3dCamera["eye"]) => new THREE.Vector3(q.x * MM, q.z * MM, -q.y * MM);
     const eye = s(camera.eye);
     const target = s(camera.target);
-    if (Math.abs(this.perspective.fov - camera.fovDeg) > 1e-6) {
-      this.perspective.fov = camera.fovDeg;
+    const clampedFov = Math.min(120, Math.max(5, camera.fovDeg));
+    const fovChanged = Math.abs(this.perspective.fov - clampedFov) > 1e-6;
+    if (fovChanged) {
+      this.perspective.fov = clampedFov;
       this.perspective.updateProjectionMatrix();
+      this.fovDirty = false;
     }
     const moving = this.controls.setLookAt(eye.x, eye.y, eye.z, target.x, target.y, target.z, animate);
     const cam = this.camera3d();
     if (cam instanceof THREE.OrthographicCamera) {
       await Promise.all([moving, this.controls.zoomTo((cam.top - cam.bottom) / Math.max(1e-6, camera.orthoHeightMm * MM), animate)]);
     } else await moving;
+    // The plan conversion may have left a focal offset behind (a pinned orbit point kept its
+    // screen place): setLookAt does not clear one, so the restored view would aim off its
+    // target and read as a small turn. Clear it and let it apply before re-pinning, because
+    // setOrbitPoint keeps the point where it currently sits on screen. The saved camera is
+    // the truth; the pin follows it.
+    this.controls.setFocalOffset(0, 0, 0, false);
+    this.controls.update(0);
+    if (this.orbitPointPinned) {
+      pinOrbitPoint(this.controls, target);
+      this.controls.update(0);
+    }
+    if (fovChanged) {
+      for (const listener of this.cameraListeners) listener();
+      for (const listener of this.cameraSettledListeners) listener();
+    }
     await this.fragments.update(true);
   }
 
@@ -1929,7 +2154,14 @@ export class ModelViewer3D {
   setOriginGizmo(position: Vec3Tuple, visible: boolean) {
     this.origin.position.set(...position);
     this.origin.visible = visible;
+    this.originAxes.position.set(...position);
+    this.originAxes.visible = visible && this.mode === "3d";
     for (const listener of this.cameraListeners) listener();
+  }
+
+  /** True when the 3D viewport renders depth-aware origin axis lines (dimmed behind building geometry). */
+  usesDepthAwareOriginAxes(): boolean {
+    return this.mode === "3d";
   }
 
   /** Where the origin marker and its axis lines are on the canvas (px from its top-left); null while hidden. */
@@ -2409,6 +2641,14 @@ export class ModelViewer3D {
     this.controls.setPointerBlocked(this.pointerClaims.size > 0);
   }
 
+  /** Display or clear a trade-agnostic 3D false-color scalar heatmap overlay over floors/workplanes. */
+  setScalarHeatmap(overlay: ScalarHeatmapOverlay | null): void {
+    disposeObject(this.scalarHeatmapRoot);
+    this.scalarHeatmapRoot.clear();
+    if (!overlay || overlay.cells.length === 0) return;
+    this.scalarHeatmapRoot.add(buildScalarHeatmapGroup(overlay));
+  }
+
   dispose() {
     if (this.planFootprintsIdle) {
       if (this.planFootprintsIdle.idle) window.cancelIdleCallback(this.planFootprintsIdle.id);
@@ -2424,10 +2664,13 @@ export class ModelViewer3D {
     disposeObject(this.ghostRoot);
     disposeObject(this.joinRoot);
     disposeObject(this.planSymbolRoot);
+    disposeObject(this.scalarHeatmapRoot);
+    this.lightingController?.dispose();
     disposeObject(this.selectedRoot);
     this.planSymbolMaterial?.dispose();
     for (const { texture } of this.planTextTextures.values()) texture.dispose();
     this.planTextTextures.clear();
+    disposeObject(this.originAxes);
     disposeObject(this.origin);
     this.cropOutline.dispose();
     if (this.markerMaterials) {
@@ -2438,6 +2681,8 @@ export class ModelViewer3D {
     }
     for (const entry of this.toneMaterials.values()) entry.material.dispose();
     this.dashedEdge?.dispose();
+    this.studioEnv?.dispose();
+    this.studioEnv = null;
     this.palette.dispose();
     void this.fragments.dispose();
     this.renderer.dispose();

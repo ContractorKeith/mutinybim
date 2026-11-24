@@ -10,7 +10,7 @@ import type { ConnectionStatus, Presence, SaveState } from '@permitzip/bim-sync'
 import { type ConnectionProblem } from './operator-messages'
 import { SHEET_FIRM_NAME, type SheetTitle } from '../contracts/building-model/sheet-title'
 import { panButtonOf } from '@permitzip/bim-viewer-3d/pan-buttons'
-import type { LoadedReference, ModelViewer3D, Pick as ViewerPick } from '@permitzip/bim-viewer-3d'
+import type { LoadedReference, ModelViewer3D, Pick as ViewerPick, SceneLightingPreset } from '@permitzip/bim-viewer-3d'
 import { elevationCut, kernelToScene, livePlanCutMm, liveView, type Projection } from '@permitzip/bim-viewer-3d/light'
 import { Alert, AlertDescription, AlertTitle } from '../ui/alert'
 import { Avatar, AvatarFallback } from '../ui/avatar'
@@ -151,7 +151,7 @@ import { besidePropertiesRight, propertiesSurfaceClass } from './layout/properti
 import type { ViewDisplay } from './views-sheets/ViewPropertiesPanel'
 import { newViewDisplay, useViewDisplayPrefsFrom } from './views-sheets/use-view-display-prefs'
 import { useViewCameraMemoryFrom } from './views-sheets/use-view-camera-memory'
-import { cameraMemoryKey, framingSignature } from './views-sheets/view-camera-memory'
+import { CameraPlacement, cameraMemoryKey, framingSignature } from './views-sheets/view-camera-memory'
 import { FREE_3D_KEY } from '../contracts/building-model/view-camera-prefs'
 import { VIEW_TYPE_LABEL, newId, type CreatableViewType, type OpenItem, type SubmitCommand } from './views-sheets/types'
 import { useSheetImagesFrom } from '@permitzip/bim-editor/editor/views-sheets/use-sheet-images'
@@ -219,9 +219,6 @@ const ORGANIZATION_ZONES: ReadonlySet<string> = new Set([ORGANIZATION_ZONE])
 export type BuildingModelView = '3d' | 'plan' | 'sheet'
 
 export type { BuildingModelTool } from './building-model-ribbon'
-
-/** Space the properties panel takes on the right of the canvas (w-80), so overlays clear it. */
-const PROPERTIES_PANEL_PX = 320
 
 /** Keys typed into a field are the field's, not the view's. */
 function typingInField(target: EventTarget | null): boolean {
@@ -323,6 +320,19 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
   /** Print dialog: the saved revision and how many of your unsaved edits touch the sheet, taken when it opened. */
   const [printing, setPrinting] = useState<{ savedRevision: number; pendingOnSheet: number } | null>(null)
   const [viewer, setViewer] = useState<ModelViewer3D | null>(null)
+  const [lightingPreset, setLightingPresetState] = useState<SceneLightingPreset>('noon')
+  const applyLightingPreset = useCallback((next: SceneLightingPreset) => {
+    setLightingPresetState(next)
+    viewer?.setLightingPreset(next)
+  }, [viewer])
+  const setViewerScalarHeatmap = useCallback(
+    (overlay: Parameters<ModelViewer3D['setScalarHeatmap']>[0]) => viewer?.setScalarHeatmap(overlay),
+    [viewer],
+  )
+  const setViewerLightEmitters = useCallback(
+    (emitters: Parameters<ModelViewer3D['setLightEmitters']>[0]) => viewer?.setLightEmitters(emitters),
+    [viewer],
+  )
   const mutinyTheme = useMutinyTheme()
   const presentation = useMutinyPresentation()
   const bimRoot = useMutinyPortalContainer()
@@ -729,6 +739,8 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
   const shownCamera = useRef<{ readonly viewer: unknown; readonly key: string } | null>(null)
   // Where the Top-down plan was left, for this tab: it reopens there after other views.
   const topDownPlan = useRef(new TopDownPlanMemory())
+  // A settle while a placement is still running says where the camera was, not where this person is.
+  const cameraPlacing = useRef(new CameraPlacement())
   // Read before the canvas resizes under the drawing and the viewer re-fits the plan beneath it.
   useLayoutEffect(() => {
     if (viewer && showDrawing && shownCamera.current?.viewer === viewer) topDownPlan.current.coveredByDrawing(viewer, shownCamera.current.key)
@@ -760,7 +772,9 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
       viewer.setAuthoredLevels(shown.levels)
       if (view.viewType === 'floor_plan' || view.viewType === 'ceiling_plan') {
         await viewer.setVerticalSection(null)
+        if (cancelled) return
         await viewer.isolateLevel(props.level ?? null)
+        if (cancelled) return
         const cut = livePlanCutMm(current, view, floor)
         viewer.setMode('plan', cut)
         viewer.setPlanCut(cut)
@@ -769,12 +783,15 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
         if (!cancelled) viewer.setPlanCrop(props.cropView === false ? null : { min: view.cropMin, max: view.cropMax })
       } else if ((view.viewType === 'section' || view.viewType === 'elevation') && props.section) {
         await viewer.isolateLevel(null)
+        if (cancelled) return
         await viewer.setVerticalSection({ ...props.section, eyeElevationMm: floor + 1600 })
       } else if (view.viewType === 'three_d') {
         await viewer.setVerticalSection(null)
+        if (cancelled) return
         viewer.setMode('3d')
         viewer.setPlanCrop(null)
         await viewer.isolateLevel(props.level ?? null)
+        if (cancelled) return
         // The 3D crop box itself is applied by useCrop3d.
         // Where this person left this view last, else the view's own camera (what prints).
         const camera = cameraFor(view.id) ?? viewCamera3d(current, view)
@@ -782,9 +799,12 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
         else await viewer.framePlanRect(view.cropMin, view.cropMax)
       }
     }
+    const placementToken = cameraPlacing.current.start()
     void run().catch((err: unknown) => {
       console.error('[BuildingModelSurface] opening the view in the canvas failed', { cameraKey, err })
       toast.error("The view couldn't be shown in the canvas. Its printed drawing is still available.")
+    }).finally(() => {
+      cameraPlacing.current.finish(placementToken)
     })
     return () => {
       cancelled = true
@@ -797,6 +817,11 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
   useEffect(() => {
     if (!viewer || !cameraRememberKey || !cameraMemory.loaded) return
     return viewer.onCameraSettled(() => {
+      // Opening a view moves the camera in steps: a settle that lands while the placement is still
+      // running says where the camera was before the view opened (the previous view's position),
+      // not where this person is — remembering it would make the view open at the previous view's
+      // camera from then on.
+      if (cameraPlacing.current.inFlight) return
       const camera = viewer.camera3dState()
       if (camera) rememberCamera(cameraRememberKey, camera)
     })
@@ -2044,15 +2069,17 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
         else requestDelete(toDelete.id)
         return
       }
-      // Drawings handle their own Tab, Escape and drafting keys (`ModelDrawingLayer`, `DrawingCanvas`).
-      if (showDrawing) return
       if (tool === 'select' && session && !e.metaKey && !e.ctrlKey && !e.altKey) {
         const ids = selection?.kind === 'group' ? selection.ids : selection?.kind === 'authored' ? [selection.element.id] : []
-        if (ids.length > 0 && isNudgeKey(e.key)) {
+        if (ids.length > 0 && !e.defaultPrevented && isNudgeKey(e.key)) {
           e.preventDefault()
           setToolHint(session.nudgeSelection(ids, e.key, e.shiftKey))
           return
         }
+      }
+      // Drawings handle their own Tab, Escape and drafting keys (`ModelDrawingLayer`, `DrawingCanvas`).
+      if (showDrawing) return
+      if (tool === 'select' && session && !e.metaKey && !e.ctrlKey && !e.altKey) {
         if ((e.key === 'a' || e.key === 'A') && canEdit && selection?.kind === 'authored' && (selection.element.kind === 'run_segment' || selection.element.kind === 'run_fitting')) {
           e.preventDefault()
           routeLike(selection.element)
@@ -2560,6 +2587,10 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
     choosePlace: () => chooseTool('place'),
     routeAs,
     previewParts: previewProposal,
+    setScalarHeatmap: setViewerScalarHeatmap,
+    setLightEmitters: setViewerLightEmitters,
+    setLightingPreset: applyLightingPreset,
+    lightingPreset,
     subscribeHover: (listener) => sessionRef.current?.onHoverChange(listener) ?? (() => undefined),
     setClickHandler: (claimer) => {
       clickClaimerRef.current = claimer
@@ -3524,7 +3555,7 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
             <OrientationControls
               trueNorthDeg={site.trueNorthDeg}
               viewer={viewer}
-              rightInset={openView || selection ? PROPERTIES_PANEL_PX : 0}
+              rightInset={propertiesOpen ? propertiesWidth : 0}
               canCreateViews={canEdit}
               blockedReason={blockedReason}
               onCreatePlan={() => setRequest({ kind: 'new_view', viewType: 'floor_plan' })}
@@ -3562,6 +3593,10 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
                 blockedReason={blockedReason}
                 submit={submitWithUndo}
                 onOpenView={(id) => {
+                  const clickedView = index?.views.find((v) => v.id === id)
+                  const openForm = sharedValue<(kind: string, elementId: string) => boolean>(workflows.shared, 'openFormView')
+                  const form = clickedView?.props?.formSchedule
+                  if (form?.kind && form.elementId && openForm?.(form.kind, form.elementId)) return
                   const from = openSheet?.id ?? null
                   openItem({ kind: 'view', id })
                   setReturnSheet(from)
@@ -3589,7 +3624,7 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
                   if (placingNewOnDrawing) chooseTool('select')
                   else stopPlannedPlacing(plannedPlacing ? `Stopped placing ${plannedPlacing.label}; nothing changed.` : null)
                 }}
-                spaces={{ projectId, mode: spacesTool.mode, onDrawn: spacesTool.onDrawn, onCancel: spacesTool.stop, onSeparatorLine: spacesTool.onSeparatorLine }}
+                spaces={{ projectId, mode: spacesTool.mode, drawerOpen: spacesOpen, onDrawn: spacesTool.onDrawn, onCancel: spacesTool.stop, onSeparatorLine: spacesTool.onSeparatorLine }}
                 ceilings={ceilingTool.canvas}
                 questions={{ onOpen: openQuestion, focusedQuestionId: questionFocus?.questionId ?? null }}
                 blockFreshness={openSheet ? (itemId) => <SheetFreshness projectId={projectId} modelId={config?.authority?.modelId ?? shownModel.modelId} sheetNumber={openSheet.number} revision={shownModel.revision} blockId={itemId} /> : undefined}
@@ -3676,6 +3711,7 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
                 submit={submitWithUndo}
                 editBlocked={canEdit ? null : blockedReason}
                 onOpenSheet={(sheetId) => openItem({ kind: 'sheet', id: sheetId })}
+                onOpenFormEditor={sharedValue<(kind: string, elementId: string) => boolean>(workflows.shared, 'openFormView') ?? undefined}
               />
                 )}
               </ModelFromStore>
@@ -3718,7 +3754,7 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
             </div>
           )}
           {status === 'read_only' && !phase && !showDrawing && (
-            <div className="absolute bottom-3 left-3 max-w-sm">
+            <div className="absolute bottom-14 left-3 max-w-sm">
               <Alert>
                 <Wind />
                 <AlertTitle>View only</AlertTitle>
@@ -3739,25 +3775,6 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
             <ToolHintBar text={toolHint} tone={toolHint === refusal ? 'warning' : 'info'} style={propertiesOpen ? { right: propertiesWidth + 24 } : undefined} />
           )}
           {showDrawing && <TrackpadHint />}
-          {!scheduleGridOpen && (
-            <SelectionLocksBar
-              viewer={viewer}
-              is3d={!showDrawing && !planOpen}
-              hasSelection={selectedIds.length > 0}
-              selectionLocked={selectedIds.length > 0 && selectedIds.every((id) => lockOf(model?.elements[id]) !== null)}
-              canEdit={canEdit}
-              onTogglePin={() => {
-                if (!model || selectedIds.length === 0) return
-                const allLocked = selectedIds.every((id) => lockOf(model.elements[id]) !== null)
-                submitWithUndo(
-                  allLocked
-                    ? { type: 'unlock_elements', elementIds: [...selectedIds] }
-                    : { type: 'lock_elements', elementIds: [...selectedIds], state: 'existing', reason: 'Pinned by user' },
-                  allLocked ? 'Unpin selection' : 'Pin selection',
-                )
-              }}
-            />
-          )}
           {viewer && !showDrawing && !scheduleGridOpen && <OrbitPointMarker viewer={viewer} enabled={!planOpen} />}
           {viewer && !showDrawing && !scheduleGridOpen && <ZoomThroughNotice viewer={viewer} />}
           {backSheet && !showDrawing && !drawingSection && (
@@ -3971,9 +3988,32 @@ export function BuildingModelSurface({ projectId, projectName, projectNumber, us
           )}
         </div>
       </div>
-      <ModelFromStore store={modelStore} zones={ORGANIZATION_ZONES}>
-        {(shown) => <OrganizationStatusBar model={shown} canEdit={canEdit} blockedReason={blockedReason} submit={submitWithUndo} onRefused={(message) => toast.error(message)} />}
-      </ModelFromStore>
+      <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-t bg-background px-3 text-xs">
+        <ModelFromStore store={modelStore} zones={ORGANIZATION_ZONES}>
+          {(shown) => <OrganizationStatusBar model={shown} canEdit={canEdit} blockedReason={blockedReason} submit={submitWithUndo} onRefused={(message) => toast.error(message)} />}
+        </ModelFromStore>
+        {!scheduleGridOpen && (
+          <SelectionLocksBar
+            viewer={viewer}
+            lightingPreset={lightingPreset}
+            onLightingPresetChange={applyLightingPreset}
+            is3d={!showDrawing && !planOpen}
+            hasSelection={selectedIds.length > 0}
+            selectionLocked={selectedIds.length > 0 && selectedIds.every((id) => lockOf(model?.elements[id]) !== null)}
+            canEdit={canEdit}
+            onTogglePin={() => {
+              if (!model || selectedIds.length === 0) return
+              const allLocked = selectedIds.every((id) => lockOf(model.elements[id]) !== null)
+              submitWithUndo(
+                allLocked
+                  ? { type: 'unlock_elements', elementIds: [...selectedIds] }
+                  : { type: 'lock_elements', elementIds: [...selectedIds], state: 'existing', reason: 'Pinned by user' },
+                allLocked ? 'Unpin selection' : 'Pin selection',
+              )
+            }}
+          />
+        )}
+      </div>
       {organizationDialog !== null && (
         <ModelFromStore store={modelStore}>
           {(shown) =>
